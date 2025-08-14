@@ -7,19 +7,16 @@ from scipy.stats import mannwhitneyu, brunnermunzel, ttest_rel, ttest_ind, wilco
 from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 
-st.set_page_config(page_title="Nonparam P-Values (Active vs Placebo)", layout="wide")
-st.title("Nonparametric P-Values — Active vs Placebo")
+st.set_page_config(page_title="Nonparam P-Values — Pairwise + Repeated Measures", layout="wide")
+st.title("Nonparametric Analysis — Pairwise (A vs B) + Repeated Measures (All Groups)")
 st.caption(
-    "Upload an Excel with either an **Input** sheet (raw Baseline & Day 28/56/84 columns, "
-    "e.g., QOL/IPSS/etc.) or a **Change Wide** sheet (Day28_change/Day56_change/Day84_change). "
-    "The app auto-detects layout, builds CHANGE_WIDE & SUMMARY, renders a chart, and computes "
-    "Mann–Whitney, Brunner–Munzel, effect sizes (Cliff’s δ, Hodges–Lehmann), "
-    "paired Wilcoxon & paired t (within-group), Welch t on changes (between-group), "
-    "rank-based repeated-measures (Group, Time, Group×Time), and adds a PRIMARY ENDPOINT row: "
-    "Final-visit Mann–Whitney (A vs P)."
+    "Upload an Excel with either an **Input** sheet (Baseline & Day 28/56/84 columns) "
+    "or a **Change Wide** sheet (Day28_change/Day56_change/Day84_change). "
+    "Select any two groups for pairwise testing (MWU/BM/Welch). "
+    "Repeated-measures (Group, Time, Group×Time) is run across **all groups**."
 )
 
-# ------------------ Settings ------------------
+# ---------- Settings ----------
 DEFAULT_VISITS = ["Day28", "Day56", "Day84"]
 with st.sidebar:
     st.header("Settings")
@@ -27,11 +24,10 @@ with st.sidebar:
     VISITS = [v.strip() for v in visits_text.split(",") if v.strip()]
     st.caption("E.g., Day28, Day56, Day84")
 
-# ------------------ Helpers -------------------
+# ---------- Helpers ----------
 def norm(s): return str(s).strip().lower()
 
 def infer_col(df, must_have=(), any_of=()):
-    """Find first column whose name contains all 'must_have' and any of 'any_of' (if provided)."""
     for c in df.columns:
         lc = norm(c)
         if all(m in lc for m in must_have) and (not any_of or any(a in lc for a in any_of)):
@@ -53,32 +49,21 @@ def hodges_lehmann(a, b):
     diffs = a.reshape(-1,1) - b.reshape(1,-1)
     return float(np.median(diffs))
 
-# ---------- Input -> CHANGE_WIDE ----------
+# ---------- Builders ----------
 def build_long_from_input(df, visits):
     df = df.rename(columns=lambda x: str(x).strip())
-
-    # Subject detection (lenient)
-    subj = (infer_col(df, ("subject",)) or
-            infer_col(df, ("participant","id")) or
-            infer_col(df, ("subject","id")) or
-            infer_col(df, ("id",)) or
-            "Subject")
+    subj = (infer_col(df, ("subject",)) or infer_col(df, ("participant","id")) or
+            infer_col(df, ("subject","id")) or infer_col(df, ("id",)) or "Subject")
     grp  = infer_col(df, ("group",)) or "Group"
-
-    # Baseline detection: accept baseline/base/BL_ variants
-    base = (infer_col(df, ("baseline",)) or
-            infer_col(df, ("base",)) or
-            infer_col(df, ("bl_",)) or
-            infer_col(df, ("bl ",)) or
-            infer_col(df, (" bl",)) or
-            infer_col(df, ("bl",)))
+    base = (infer_col(df, ("baseline",)) or infer_col(df, ("base",)) or
+            infer_col(df, ("bl_",)) or infer_col(df, ("bl ",)) or
+            infer_col(df, (" bl",)) or infer_col(df, ("bl",)))
     if not base:
-        return None, None, None, "Baseline column not found (looked for baseline/base/BL_)."
+        return None, None, None, "Baseline column not found (baseline/base/BL_)."
 
-    # Visit columns: look for day markers; trailing metric text can be anything
     visit_map = {}
     for v in visits:
-        aliases = [v.lower(), v.lower().replace("day","day ")]  # day28 / day 28
+        aliases = [v.lower(), v.lower().replace("day","day ")]
         col = None
         for c in df.columns:
             lc = norm(c)
@@ -88,18 +73,22 @@ def build_long_from_input(df, visits):
             return None, None, None, f"Raw column for {v} not found."
         visit_map[v] = col
 
-    inp_echo = df[[subj, grp, base] + list(visit_map.values())].copy()
-    inp_echo.columns = ["Subject","Group","Baseline"] + visits
-    inp_echo = inp_echo.dropna(subset=["Subject","Group"])
-    inp_echo["Group"] = inp_echo["Group"].astype(str).str.strip()
-    inp_echo = inp_echo[inp_echo["Group"].isin(["Active","Placebo"])]
+    inp = df[[subj, grp, base] + list(visit_map.values())].copy()
+    inp.columns = ["Subject","Group","Baseline"] + visits
 
-    # change-from-baseline
-    chg_wide = inp_echo[["Subject","Group"]].copy()
+    # normalize groups (trim/case only; keep original names like Placebo/USPlus/Permixon)
+    inp["Group"] = inp["Group"].astype(str).str.strip()
+
+    # force numeric
+    for c in ["Baseline"] + visits:
+        inp[c] = pd.to_numeric(inp[c], errors="coerce")
+
+    # CHANGE_WIDE
+    chg_wide = inp[["Subject","Group"]].copy()
     for v in visits:
-        chg_wide[f"{v}_change"] = inp_echo[v] - inp_echo["Baseline"]
+        chg_wide[f"{v}_change"] = inp[v] - inp["Baseline"]
 
-    # long format for RM and per-visit tests
+    # long
     rows = []
     for _, r in chg_wide.iterrows():
         for v in visits:
@@ -108,22 +97,17 @@ def build_long_from_input(df, visits):
                 rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v, "Change": float(val)})
     long_change = pd.DataFrame(rows)
     if long_change.empty:
-        return None, None, None, "No change values computed."
+        return None, None, None, "No change values computed (non-numeric inputs?)."
     long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
-    return long_change, chg_wide.copy(), inp_echo.copy(), None
+    return long_change, chg_wide, inp, None
 
-# ---------- CHANGE_WIDE (already) ----------
 def build_long_from_changewide(df, visits):
     df = df.rename(columns=lambda x: str(x).strip())
-
-    subj = (infer_col(df, ("subject",)) or
-            infer_col(df, ("participant","id")) or
-            infer_col(df, ("subject","id")) or
-            infer_col(df, ("id",)) or
-            "Subject")
+    subj = (infer_col(df, ("subject",)) or infer_col(df, ("participant","id")) or
+            infer_col(df, ("subject","id")) or infer_col(df, ("id",)) or "Subject")
     grp  = infer_col(df, ("group",)) or "Group"
-
     change_words = ("change","delta","diff")
+
     vmap = {}
     for v in visits:
         aliases = [v.lower(), v.lower().replace("day","day ")]
@@ -137,14 +121,14 @@ def build_long_from_changewide(df, visits):
             for c in df.columns:
                 if norm(c) == exact:
                     col = c; break
-        if not col:
-            return None, None, f"Change column for {v} not found."
+        if not col: return None, None, f"Change column for {v} not found."
         vmap[v] = col
 
     use = df[[subj, grp] + list(vmap.values())].copy()
     use.columns = ["Subject","Group"] + visits
     use["Group"] = use["Group"].astype(str).str.strip()
-    use = use[use["Group"].isin(["Active","Placebo"])]
+    for v in visits:
+        use[v] = pd.to_numeric(use[v], errors="coerce")
 
     rows = []
     for _, r in use.iterrows():
@@ -156,141 +140,122 @@ def build_long_from_changewide(df, visits):
     if long_change.empty:
         return None, None, "No change values found."
     long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
-    return long_change, use.copy(), None
+    return long_change, use, None
 
-# ---------- Core stats with robust RM + FINAL MW row ----------
-def compute_nonparam_between_and_rm(long_change, visits):
-    # Working copy
+# ---------- Core stats ----------
+def compute_rm_all_groups(long_change, visits):
+    """RM across ALL groups (Group, Time, Interaction). Drops visits lacking any group data."""
     lc = long_change.copy()
+    lc["Change"] = pd.to_numeric(lc["Change"], errors="coerce")
+    lc = lc.dropna(subset=["Group","Time","Change"]).copy()
 
-    # Keep only visits present AND with both groups represented
-    observed_times = lc["Time"].dropna().astype(str).unique().tolist()
-    observed_times = [v for v in visits if v in observed_times]
-    valid_visits = []
-    for v in observed_times:
-        nA = lc[(lc["Time"] == v) & (lc["Group"] == "Active")].shape[0]
-        nP = lc[(lc["Time"] == v) & (lc["Group"] == "Placebo")].shape[0]
-        if nA > 0 and nP > 0:
-            valid_visits.append(v)
+    # Keep visits that actually appear
+    observed = [v for v in visits if v in lc["Time"].astype(str).unique().tolist()]
+    # Need at least 2 time levels overall
+    if len(observed) < 2:
+        return pd.DataFrame({
+            "Effect": ["Group (all groups)", f"Time ({', '.join(observed) if observed else '—'})", "Group × Time"],
+            "p-value": [np.nan, np.nan, np.nan]
+        }), observed
 
-    # Filter to valid visits only
-    lc = lc[lc["Time"].isin(valid_visits)].copy()
-    lc["Time"] = pd.Categorical(lc["Time"], categories=valid_visits, ordered=True)
+    lc["rank_change"] = lc["Change"].rank(method="average")
+    model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=lc).fit()
+    an = anova_lm(model, typ=3)
 
-    # Rank-based RM (subject-blocked) — only if ≥2 valid time points
-    if len(valid_visits) < 2:
-        group_p = time_p = inter_p = np.nan
-    else:
-        lc["rank_change"] = lc["Change"].rank(method="average")
-        model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=lc).fit()
-        an = anova_lm(model, typ=3)
-        group_p = float(an.loc["C(Group)", "PR(>F)"])
-        time_p  = float(an.loc["C(Time)", "PR(>F)"])
-        inter_p = float(an.loc["C(Group):C(Time)", "PR(>F)"])
+    rm_df = pd.DataFrame({
+        "Effect": ["Group (all groups)", f"Time ({', '.join(observed)})", "Group × Time"],
+        "p-value": [float(an.loc["C(Group)","PR(>F)"]),
+                    float(an.loc["C(Time)","PR(>F)"]),
+                    float(an.loc["C(Group):C(Time)","PR(>F)"])]
+    })
+    return rm_df, observed
 
-    # Per-visit tests (use same filtered visits)
+def compute_pairwise_between(long_change, visits, group_a, group_b):
+    """Between-group tests (MWU, BM, Welch) for a selected pair, per visit, and Summary for chart."""
+    lc = long_change[long_change["Group"].isin([group_a, group_b])].copy()
+    lc["Change"] = pd.to_numeric(lc["Change"], errors="coerce")
+    lc = lc.dropna(subset=["Change","Time","Group"]).copy()
+
+    # valid visits require data in both groups
+    valid = []
+    diag = []
+    for v in [vv for vv in visits if vv in lc["Time"].astype(str).unique().tolist()]:
+        nA = lc[(lc["Time"]==v) & (lc["Group"]==group_a)]["Change"].notna().sum()
+        nB = lc[(lc["Time"]==v) & (lc["Group"]==group_b)]["Change"].notna().sum()
+        if nA>0 and nB>0: valid.append(v)
+        diag.append({"Visit": v, f"N {group_a}": int(nA), f"N {group_b}": int(nB),
+                     "Status": "kept" if (nA>0 and nB>0) else "dropped: need both groups"})
+
     rows = []
     sumrows = []
-    for v in valid_visits:
-        a = lc.loc[(lc["Group"]=="Active") & (lc["Time"]==v), "Change"]
-        p = lc.loc[(lc["Group"]=="Placebo") & (lc["Time"]==v), "Change"]
+    for v in valid:
+        a = lc[(lc["Time"]==v) & (lc["Group"]==group_a)]["Change"]
+        b = lc[(lc["Time"]==v) & (lc["Group"]==group_b)]["Change"]
 
-        # Mann–Whitney
-        U, mw_p = (np.nan, np.nan)
-        if len(a)>0 and len(p)>0:
-            U, mw_p = mannwhitneyu(a, p, alternative="two-sided")
+        U = mw_p = bm_stat = bm_p = np.nan
+        if len(a)>0 and len(b)>0:
+            U, mw_p = mannwhitneyu(a, b, alternative="two-sided")
+            if len(a)>3 and len(b)>3:
+                bm_stat, bm_p = brunnermunzel(a, b, alternative="two-sided")
 
-        # Brunner–Munzel (≥4 per group typical)
-        bm_stat, bm_p = (np.nan, np.nan)
-        if len(a)>3 and len(p)>3:
-            bm_stat, bm_p = brunnermunzel(a, p, alternative="two-sided")
+        d = cliffs_delta(a, b) if len(a)>0 and len(b)>0 else np.nan
+        hl = hodges_lehmann(a, b) if len(a)>0 and len(b)>0 else np.nan
 
-        # Effect sizes
-        d_cliff = cliffs_delta(a, p)
-        hl = hodges_lehmann(a, p)
-
-        # Rank-biserial r (direction by median diff)
         r_rb = np.nan
-        if len(a)>0 and len(p)>0 and not np.isnan(U):
-            n1, n2 = len(a), len(p)
-            r_rb = 1 - 2 * U / (n1 * n2)
-            med_diff = (np.median(a) - np.median(p)) if (len(a) and len(p)) else 0.0
-            if np.sign(r_rb) == 0 and med_diff != 0:
-                r_rb = np.sign(med_diff) * abs(r_rb)
+        if len(a)>0 and len(b)>0 and not np.isnan(U):
+            r_rb = 1 - 2 * U / (len(a)*len(b))
 
         rows.append({
             "Visit": v,
-            "N Active": int(len(a)), "N Placebo": int(len(p)),
-            "Active median Δ": float(np.median(a)) if len(a)>0 else np.nan,
-            "Placebo median Δ": float(np.median(p)) if len(p)>0 else np.nan,
+            f"N {group_a}": int(len(a)),
+            f"N {group_b}": int(len(b)),
+            f"{group_a} median Δ": float(np.median(a)) if len(a)>0 else np.nan,
+            f"{group_b} median Δ": float(np.median(b)) if len(b)>0 else np.nan,
             "Mann–Whitney U": float(U) if U==U else np.nan,
             "Mann–Whitney p": float(mw_p) if mw_p==mw_p else np.nan,
             "Brunner–Munzel stat": float(bm_stat) if bm_stat==bm_stat else np.nan,
             "Brunner–Munzel p": float(bm_p) if bm_p==bm_p else np.nan,
-            "Cliff's delta": float(d_cliff) if d_cliff==d_cliff else np.nan,
-            "Hodges–Lehmann (Δ A−P)": float(hl) if hl==hl else np.nan,
+            "Cliff's delta": float(d) if d==d else np.nan,
+            "Hodges–Lehmann (Δ A−B)": float(hl) if hl==hl else np.nan,
             "Rank-biserial r": float(r_rb) if r_rb==r_rb else np.nan,
         })
 
-        # Summary for chart (median & IQR)
         def qstats(x):
             if len(x)==0: return (np.nan, np.nan, np.nan, np.nan, np.nan)
-            med = np.median(x); q1 = np.percentile(x, 25); q3 = np.percentile(x, 75)
+            med = np.median(x); q1 = np.percentile(x,25); q3 = np.percentile(x,75)
             return med, q1, q3, (q3-med), (med-q1)
 
         amed, aq1, aq3, aplus, aminus = qstats(a)
-        pmed, pq1, pq3, pplus, pminus = qstats(p)
+        bmed, bq1, bq3, bplus, bminus = qstats(b)
         sumrows.append({
             "Time": v,
-            "Active_median": amed, "Active_Q1": aq1, "Active_Q3": aq3,
-            "Placebo_median": pmed, "Placebo_Q1": pq1, "Placebo_Q3": pq3,
-            "Active_plus": aplus, "Active_minus": aminus,
-            "Placebo_plus": pplus, "Placebo_minus": pminus
+            f"{group_a}_median": amed, f"{group_a}_Q1": aq1, f"{group_a}_Q3": aq3,
+            f"{group_b}_median": bmed, f"{group_b}_Q1": bq1, f"{group_b}_Q3": bq3,
+            f"{group_a}_plus": aplus, f"{group_a}_minus": aminus,
+            f"{group_b}_plus": bplus, f"{group_b}_minus": bminus
         })
 
     pv_df = pd.DataFrame(rows)
-
-    # --- RM (global) summary table ---
-    rm_df = pd.DataFrame({
-        "Effect": ["Group (Active vs Placebo)",
-                   f"Time ({', '.join(valid_visits)})",
-                   "Group × Time interaction"],
-        "p-value": [group_p, time_p, inter_p]
-    })
-
-    # --- PRIMARY ENDPOINT: Final visit Mann–Whitney (A vs P) ---
-    final_visit = valid_visits[-1] if len(valid_visits) > 0 else None
-    if final_visit is not None:
-        a_final = lc.loc[(lc["Group"]=="Active") & (lc["Time"]==final_visit), "Change"].dropna()
-        p_final = lc.loc[(lc["Group"]=="Placebo") & (lc["Time"]==final_visit), "Change"].dropna()
-        if len(a_final) > 0 and len(p_final) > 0:
-            _, mw_p_final = mannwhitneyu(a_final, p_final, alternative="two-sided")
-            rm_df = pd.concat([
-                rm_df,
-                pd.DataFrame({
-                    "Effect": [f"Final visit Mann–Whitney (A vs P) at {final_visit}"],
-                    "p-value": [float(mw_p_final)]
-                })
-            ], ignore_index=True)
-
     summary_df = pd.DataFrame(sumrows)
-    return pv_df, rm_df, summary_df, valid_visits
+    diag_df = pd.DataFrame(diag)
+    return pv_df, summary_df, valid, diag_df
 
 def compute_within_group_tests(input_echo, visits):
-    """Within each group, paired Wilcoxon & paired t: Baseline vs each visit."""
+    """Within-group (Baseline vs each visit) for ALL groups present."""
     if input_echo is None or input_echo.empty:
         return pd.DataFrame()
+    groups = sorted(input_echo["Group"].dropna().astype(str).str.strip().unique().tolist())
     rows = []
-    for grp in ["Active", "Placebo"]:
+    for grp in groups:
         g = input_echo[input_echo["Group"] == grp]
-        base = g["Baseline"]
+        base = pd.to_numeric(g["Baseline"], errors="coerce")
         for v in visits:
-            follow = g[v] if v in g.columns else None
-            if follow is None:
+            if v not in g.columns: 
                 rows.append({"Group": grp, "Visit": v, "N (paired)": 0,
                              "Wilcoxon stat": np.nan, "Wilcoxon p": np.nan,
                              "Paired t stat": np.nan, "Paired t p": np.nan})
                 continue
+            follow = pd.to_numeric(g[v], errors="coerce")
             paired = pd.concat([base, follow], axis=1).dropna()
             if paired.shape[0] == 0:
                 w_stat = w_p = t_stat = t_p = np.nan
@@ -313,58 +278,52 @@ def compute_within_group_tests(input_echo, visits):
             })
     return pd.DataFrame(rows)
 
-def compute_ttests(long_change, visits):
-    """Between-group Welch t-tests on change-from-baseline per visit."""
+def compute_welch_on_changes(long_change, visits, group_a, group_b):
     rows = []
+    lc = long_change[long_change["Group"].isin([group_a, group_b])].copy()
     for v in visits:
-        a = long_change.loc[(long_change["Group"]=="Active") & (long_change["Time"]==v), "Change"].dropna()
-        p = long_change.loc[(long_change["Group"]=="Placebo") & (long_change["Time"]==v), "Change"].dropna()
-        if len(a)>1 and len(p)>1:
-            t_stat, t_p = ttest_ind(a, p, equal_var=False)
+        a = lc[(lc["Time"]==v) & (lc["Group"]==group_a)]["Change"].dropna()
+        b = lc[(lc["Time"]==v) & (lc["Group"]==group_b)]["Change"].dropna()
+        if len(a)>1 and len(b)>1:
+            t_stat, t_p = ttest_ind(a, b, equal_var=False)
         else:
             t_stat, t_p = (np.nan, np.nan)
-        rows.append({"Visit": v, "N Active": int(len(a)), "N Placebo": int(len(p)),
+        rows.append({"Visit": v, f"N {group_a}": int(len(a)), f"N {group_b}": int(len(b)),
                      "Welch t stat": float(t_stat) if t_stat==t_stat else np.nan,
                      "Welch t p": float(t_p) if t_p==t_p else np.nan})
     return pd.DataFrame(rows)
 
-def make_chart(summary_df, visits):
-    # Guard: if summary is empty or missing required cols, return None
-    required = {
-        "Active_median","Active_minus","Active_plus",
-        "Placebo_median","Placebo_minus","Placebo_plus","Time"
-    }
-    if summary_df is None or summary_df.empty or not required.issubset(set(summary_df.columns)):
+def make_chart(summary_df, visits, group_a, group_b):
+    # guard
+    needed = {f"{group_a}_median", f"{group_a}_minus", f"{group_a}_plus",
+              f"{group_b}_median", f"{group_b}_minus", f"{group_b}_plus", "Time"}
+    if summary_df is None or summary_df.empty or not needed.issubset(set(summary_df.columns)):
         return None
-
-    # Ensure correct order / subset to visits actually present
-    summary_df = summary_df.copy().set_index("Time").reindex(visits).reset_index()
+    df = summary_df.copy().set_index("Time").reindex(visits).reset_index()
 
     fig, ax = plt.subplots(figsize=(8,5))
-    x = np.arange(len(summary_df))
+    x = np.arange(len(df))
 
-    a_med = summary_df["Active_median"].to_numpy()
-    a_lo  = a_med - summary_df["Active_minus"].to_numpy()
-    a_hi  = a_med + summary_df["Active_plus"].to_numpy()
+    a_med = df[f"{group_a}_median"].to_numpy()
+    a_lo  = a_med - df[f"{group_a}_minus"].to_numpy()
+    a_hi  = a_med + df[f"{group_a}_plus"].to_numpy()
+    b_med = df[f"{group_b}_median"].to_numpy()
+    b_lo  = b_med - df[f"{group_b}_minus"].to_numpy()
+    b_hi  = b_med + df[f"{group_b}_plus"].to_numpy()
 
-    p_med = summary_df["Placebo_median"].to_numpy()
-    p_lo  = p_med - summary_df["Placebo_minus"].to_numpy()
-    p_hi  = p_med + summary_df["Placebo_plus"].to_numpy()
+    ax.plot(x, a_med, marker="o", label=f"{group_a} (median Δ)")
+    ax.fill_between(x, a_lo, a_hi, alpha=0.3, label=f"{group_a} IQR")
+    ax.plot(x, b_med, marker="o", label=f"{group_b} (median Δ)")
+    ax.fill_between(x, b_lo, b_hi, alpha=0.3, label=f"{group_b} IQR")
 
-    ax.plot(x, a_med, marker="o", label="Active (median Δ)")
-    ax.fill_between(x, a_lo, a_hi, alpha=0.3, label="Active IQR")
-    ax.plot(x, p_med, marker="o", label="Placebo (median Δ)")
-    ax.fill_between(x, p_lo, p_hi, alpha=0.3, label="Placebo IQR")
-
-    ax.set_xticks(x, visits)
-    ax.set_xlabel("Visit"); ax.set_ylabel("Change from Baseline")
-    ax.set_title("Median Change with IQR (Active vs Placebo)"); ax.legend()
-    fig.tight_layout()
+    ax.set_xticks(x, visits); ax.set_xlabel("Visit"); ax.set_ylabel("Change from Baseline")
+    ax.set_title(f"Median Change with IQR — {group_a} vs {group_b}")
+    ax.legend(); fig.tight_layout()
 
     buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=150); buf.seek(0)
     return buf
 
-# ------------------ UI -------------------
+# ---------- UI ----------
 st.subheader("1) Upload your Excel (.xlsx)")
 uploaded = st.file_uploader(
     "Upload a workbook that contains either an 'Input' sheet (raw) or a 'Change Wide' sheet (changes).",
@@ -375,106 +334,125 @@ if uploaded:
     try:
         xl = pd.ExcelFile(uploaded)
     except Exception as e:
-        st.error(f"Could not read Excel: {e}")
-        st.stop()
+        st.error(f"Could not read Excel: {e}"); st.stop()
 
     long_change = None; change_wide = None; input_echo = None
     used_mode = None; used_sheet = None
 
-    # Try Change Wide first
+    # Try Change Wide
     for s in xl.sheet_names:
         try:
             df = pd.read_excel(uploaded, sheet_name=s)
             lc, chg_wide, err = build_long_from_changewide(df, VISITS)
             if lc is not None and err is None and not lc.empty:
                 long_change = lc; change_wide = chg_wide; used_mode, used_sheet = "CHANGE", s; break
-        except Exception:
-            pass
+        except Exception: pass
 
-    # If not found, try Input (raw)
+    # Try Input
     if long_change is None:
         for s in xl.sheet_names:
             try:
                 df = pd.read_excel(uploaded, sheet_name=s)
-                lc, chg_wide, inp_echo, err = build_long_from_input(df, VISITS)
+                lc, chg_wide, inp, err = build_long_from_input(df, VISITS)
                 if lc is not None and err is None and not lc.empty:
-                    long_change = lc; change_wide = chg_wide; input_echo = inp_echo; used_mode, used_sheet = "RAW", s; break
-            except Exception:
-                pass
+                    long_change = lc; change_wide = chg_wide; input_echo = inp; used_mode, used_sheet = "RAW", s; break
+            except Exception: pass
 
     if long_change is None or long_change.empty:
-        st.error(
-            "Could not auto-detect a usable sheet.\n\n"
-            "Expected either:\n"
-            " • A Change Wide sheet with change columns (headers containing day 28/56/84 + change/delta/diff), OR\n"
-            " • An Input sheet with Baseline and Day 28/56/84 raw scores (QOL/IPSS/etc.)."
-        ); st.stop()
+        st.error("Could not auto-detect a usable sheet."); st.stop()
 
     st.success(f"Detected: **{used_mode}** on sheet **{used_sheet}**")
+
+    # available groups
+    all_groups = sorted(long_change["Group"].dropna().astype(str).str.strip().unique().tolist())
+    with st.sidebar:
+        st.markdown("### Pairwise comparison")
+        if len(all_groups) < 2:
+            st.error("Need at least two groups in data."); st.stop()
+        default_pair = (all_groups[0], all_groups[1]) if len(all_groups) >= 2 else (all_groups[0], all_groups[0])
+        group_a = st.selectbox("Group A", all_groups, index=all_groups.index(default_pair[0]))
+        group_b = st.selectbox("Group B", all_groups, index=all_groups.index(default_pair[1]))
+        if group_a == group_b:
+            st.warning("Pick two different groups for pairwise tests.")
 
     st.subheader("2) Preview (long-format change)")
     st.dataframe(long_change.head(10))
 
-    st.subheader("3) Compute tests")
-    pv_df, rm_df, summary_df, valid_visits = compute_nonparam_between_and_rm(long_change, VISITS)
-    within_df = compute_within_group_tests(input_echo, valid_visits if input_echo is not None else valid_visits)
-    ttests_df = compute_ttests(long_change, valid_visits)
+    # RM across ALL groups
+    st.subheader("3) Repeated-measures across ALL groups")
+    rm_df, observed = compute_rm_all_groups(long_change, VISITS)
+    st.dataframe(rm_df)
 
-    c1, c2 = st.columns(2)
-    with c1: st.markdown("**P_VALUES (between-group, nonparam + effect sizes)**"); st.dataframe(pv_df)
-    with c2: st.markdown("**RM_NONPARAM_SUMMARY**"); st.dataframe(rm_df)
+    # Pairwise between-group tests
+    st.subheader(f"4) Pairwise between-group tests — {group_a} vs {group_b}")
+    pv_df, summary_df, valid_visits, diag_df = compute_pairwise_between(long_change, VISITS, group_a, group_b)
+    st.markdown("**P_VALUES (per visit)**")
+    st.dataframe(pv_df)
 
-    st.markdown("**WITHIN_GROUP_TESTS (Baseline → each visit)**")
+    with st.expander("Diagnostics (per-visit Ns for selected pair)"):
+        st.dataframe(diag_df)
+
+    # Final-visit MW added to RM table (primary endpoint for selected pair)
+    if len(valid_visits) > 0:
+        final_visit = valid_visits[-1]
+        a_final = long_change[(long_change["Group"]==group_a) & (long_change["Time"]==final_visit)]["Change"].dropna()
+        b_final = long_change[(long_change["Group"]==group_b) & (long_change["Time"]==final_visit)]["Change"].dropna()
+        if len(a_final)>0 and len(b_final)>0:
+            _, mw_p_final = mannwhitneyu(a_final, b_final, alternative="two-sided")
+            rm_df = pd.concat([rm_df, pd.DataFrame({
+                "Effect": [f"Final visit Mann–Whitney ({group_a} vs {group_b}) at {final_visit}"],
+                "p-value": [float(mw_p_final)]
+            })], ignore_index=True)
+            st.markdown("**RM_NONPARAM_SUMMARY (with final-visit MW for selected pair)**")
+            st.dataframe(rm_df)
+        else:
+            st.info("Final-visit Mann–Whitney not added: one of the groups has no data at the final visit.")
+    else:
+        st.info("No valid visits with both groups for pairwise tests; RM summary shown above for all groups.")
+
+    # Within-group for ALL groups
+    st.subheader("5) Within-group tests (Baseline → each visit, all groups)")
+    within_df = compute_within_group_tests(input_echo if input_echo is not None else pd.DataFrame(), observed or VISITS)
     st.dataframe(within_df)
 
-    st.markdown("**TTESTS (between-group Welch on change)**")
+    # Welch t (pairwise on selected pair)
+    st.subheader(f"6) Welch t-tests on change (pairwise: {group_a} vs {group_b})")
+    ttests_df = compute_welch_on_changes(long_change, valid_visits or observed or VISITS, group_a, group_b)
     st.dataframe(ttests_df)
 
-    # Per-visit counts to diagnose missing data
-    with st.expander("Per-visit N by group (after filtering)"):
-        counts = []
-        for v in valid_visits:
-            nA = long_change[(long_change["Time"]==v) & (long_change["Group"]=="Active")]["Change"].notna().sum()
-            nP = long_change[(long_change["Time"]==v) & (long_change["Group"]=="Placebo")]["Change"].notna().sum()
-            counts.append({"Visit": v, "N Active": int(nA), "N Placebo": int(nP)})
-        st.dataframe(pd.DataFrame(counts))
-
-    st.subheader("4) Chart")
-    chart_buf = make_chart(summary_df, valid_visits)
+    # Chart for selected pair
+    st.subheader("7) Chart (selected pair)")
+    chart_buf = make_chart(summary_df, valid_visits or observed, group_a, group_b)
     if chart_buf is None:
-        st.info("Chart skipped: not enough data to compute medians/IQR for both groups at any visit.")
+        st.info("Chart skipped: not enough data for selected pair.")
     else:
-        st.image(chart_buf, caption="Median change with IQR (Active vs Placebo)", use_column_width=True)
+        st.image(chart_buf, caption=f"Median Δ with IQR — {group_a} vs {group_b}", use_column_width=True)
 
-    # Build Excel in memory
+    # Build Excel
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
         if input_echo is not None: input_echo.to_excel(writer, sheet_name="INPUT_ECHO", index=False)
         change_wide.to_excel(writer, sheet_name="CHANGE_WIDE", index=False)
-        summary_df.to_excel(writer, sheet_name="SUMMARY", index=False)
-        pv_df.to_excel(writer, sheet_name="P_VALUES", index=False)
+        summary_df.to_excel(writer, sheet_name="SUMMARY_PAIR", index=False)
+        pv_df.to_excel(writer, sheet_name="P_VALUES_PAIR", index=False)
         rm_df.to_excel(writer, sheet_name="RM_NONPARAM_SUMMARY", index=False)
         within_df.to_excel(writer, sheet_name="WITHIN_GROUP_TESTS", index=False)
-        ttests_df.to_excel(writer, sheet_name="TTESTS", index=False)
-
-        # CHART sheet
-        workbook  = writer.book
-        ws_chart  = workbook.add_worksheet("CHARTS")
+        ttests_df.to_excel(writer, sheet_name="TTESTS_PAIR", index=False)
+        # chart
+        workbook = writer.book
+        ws_chart = workbook.add_worksheet("CHARTS")
         writer.sheets["CHARTS"] = ws_chart
         if chart_buf is not None:
             ws_chart.insert_image("B2", "chart.png", {"image_data": chart_buf})
         else:
-            ws_chart.write("B2", "Chart unavailable: insufficient data in both groups at the selected visits.")
+            ws_chart.write("B2", "Chart unavailable for selected pair.")
 
     out.seek(0)
-
-    st.subheader("5) Download Excel with all tabs")
     base = uploaded.name.rsplit(".",1)[0]
     st.download_button(
-        label="⬇️ Download Excel (INPUT/CHANGE/SUMMARY/CHARTS/P_VALUES/RM/WITHIN/TTESTS)",
+        "⬇️ Download Excel (INPUT/CHANGE/SUMMARY_PAIR/P_VALUES_PAIR/RM/WITHIN/TTESTS_PAIR/CHARTS)",
         data=out,
-        file_name=f"{base}_RESULTS.xlsx",
+        file_name=f"{base}_RESULTS_PAIRWISE.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    st.caption("Notes: Group labels must be exactly 'Active' and 'Placebo'. Brunner–Munzel needs ≥4 observations per group per visit.")
