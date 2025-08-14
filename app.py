@@ -17,6 +17,35 @@ st.caption(
     "paired Wilcoxon & paired t (within-group), Welch t on changes (between-group), "
     "and rank-based repeated-measures (Group, Time, Group×Time)."
 )
+import numpy as np
+
+def normalize_group(g):
+    if g is None:
+        return np.nan
+    s = str(g).strip().lower()
+
+    # Active aliases
+    active_aliases = {
+        "active", "treatment", "verum", "test",
+        "usplus", "us plus", "permixon"
+    }
+    placebo_aliases = {
+        "placebo"
+    }
+
+    if s in active_aliases:
+        return "Active"
+    if s in placebo_aliases:
+        return "Placebo"
+    return np.nan
+
+# ---- When building long from INPUT sheet ----
+inp_echo["Group"] = inp_echo["Group"].map(normalize_group)
+inp_echo = inp_echo[inp_echo["Group"].isin(["Active", "Placebo"])]
+
+# ---- When building long from CHANGE WIDE sheet ----
+use["Group"] = use["Group"].map(normalize_group)
+use = use[use["Group"].isin(["Active", "Placebo"])]
 
 # ------------------ Settings ------------------
 DEFAULT_VISITS = ["Day28", "Day56", "Day84"]
