@@ -56,7 +56,7 @@ def hodges_lehmann(a, b):
 def build_long_from_input(df, visits):
     df = df.rename(columns=lambda x: str(x).strip())
 
-    # Subject detection (be lenient)
+    # Subject detection (lenient)
     subj = (infer_col(df, ("subject",)) or
             infer_col(df, ("participant","id")) or
             infer_col(df, ("subject","id")) or
@@ -64,7 +64,7 @@ def build_long_from_input(df, visits):
             "Subject")
     grp  = infer_col(df, ("group",)) or "Group"
 
-    # Baseline detection: accept "baseline" / "base" / "BL_" variants
+    # Baseline detection: accept baseline/base/BL_ variants
     base = (infer_col(df, ("baseline",)) or
             infer_col(df, ("base",)) or
             infer_col(df, ("bl_",)) or
@@ -159,7 +159,7 @@ def build_long_from_changewide(df, visits):
 
 # ---------- Core stats with robust RM patch ----------
 def compute_nonparam_between_and_rm(long_change, visits):
-    # Make a working copy
+    # Working copy
     lc = long_change.copy()
 
     # Keep only visits present AND with both groups represented
@@ -187,7 +187,7 @@ def compute_nonparam_between_and_rm(long_change, visits):
         time_p  = float(an.loc["C(Time)", "PR(>F)"])
         inter_p = float(an.loc["C(Group):C(Time)", "PR(>F)"])
 
-    # Per-visit tests (use the same filtered set of visits)
+    # Per-visit tests (use same filtered visits)
     rows = []
     sumrows = []
     for v in valid_visits:
@@ -265,7 +265,7 @@ def compute_within_group_tests(input_echo, visits):
         base = g["Baseline"]
         for v in visits:
             follow = g[v] if v in g.columns else None
-            if follow is None: 
+            if follow is None:
                 rows.append({"Group": grp, "Visit": v, "N (paired)": 0,
                              "Wilcoxon stat": np.nan, "Wilcoxon p": np.nan,
                              "Paired t stat": np.nan, "Paired t p": np.nan})
@@ -275,7 +275,8 @@ def compute_within_group_tests(input_echo, visits):
                 w_stat = w_p = t_stat = t_p = np.nan
             else:
                 try:
-                    w_stat, w_p = wilcoxon(paired.iloc[:,0], paired.iloc[:,1], alternative="two-sided", zero_method="wilcox")
+                    w_stat, w_p = wilcoxon(paired.iloc[:,0], paired.iloc[:,1],
+                                           alternative="two-sided", zero_method="wilcox")
                 except Exception:
                     w_stat, w_p = (np.nan, np.nan)
                 try:
@@ -307,21 +308,38 @@ def compute_ttests(long_change, visits):
     return pd.DataFrame(rows)
 
 def make_chart(summary_df, visits):
+    # Guard: if summary is empty or missing required cols, return None
+    required = {
+        "Active_median","Active_minus","Active_plus",
+        "Placebo_median","Placebo_minus","Placebo_plus","Time"
+    }
+    if summary_df is None or summary_df.empty or not required.issubset(set(summary_df.columns)):
+        return None
+
+    # Ensure correct order / subset to visits actually present
+    summary_df = summary_df.copy().set_index("Time").reindex(visits).reset_index()
+
     fig, ax = plt.subplots(figsize=(8,5))
-    x = np.arange(len(visits))
-    a_med = summary_df["Active_median"].values
-    a_lo  = a_med - summary_df["Active_minus"].values
-    a_hi  = a_med + summary_df["Active_plus"].values
-    p_med = summary_df["Placebo_median"].values
-    p_lo  = p_med - summary_df["Placebo_minus"].values
-    p_hi  = p_med + summary_df["Placebo_plus"].values
+    x = np.arange(len(summary_df))
+
+    a_med = summary_df["Active_median"].to_numpy()
+    a_lo  = a_med - summary_df["Active_minus"].to_numpy()
+    a_hi  = a_med + summary_df["Active_plus"].to_numpy()
+
+    p_med = summary_df["Placebo_median"].to_numpy()
+    p_lo  = p_med - summary_df["Placebo_minus"].to_numpy()
+    p_hi  = p_med + summary_df["Placebo_plus"].to_numpy()
+
     ax.plot(x, a_med, marker="o", label="Active (median Δ)")
     ax.fill_between(x, a_lo, a_hi, alpha=0.3, label="Active IQR")
     ax.plot(x, p_med, marker="o", label="Placebo (median Δ)")
     ax.fill_between(x, p_lo, p_hi, alpha=0.3, label="Placebo IQR")
-    ax.set_xticks(x, visits); ax.set_xlabel("Visit"); ax.set_ylabel("Change from Baseline")
+
+    ax.set_xticks(x, visits)
+    ax.set_xlabel("Visit"); ax.set_ylabel("Change from Baseline")
     ax.set_title("Median Change with IQR (Active vs Placebo)"); ax.legend()
     fig.tight_layout()
+
     buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=150); buf.seek(0)
     return buf
 
@@ -391,9 +409,21 @@ if uploaded:
     st.markdown("**TTESTS (between-group Welch on change)**")
     st.dataframe(ttests_df)
 
+    # Per-visit counts to diagnose missing data
+    with st.expander("Per-visit N by group (after filtering)"):
+        counts = []
+        for v in valid_visits:
+            nA = long_change[(long_change["Time"]==v) & (long_change["Group"]=="Active")]["Change"].notna().sum()
+            nP = long_change[(long_change["Time"]==v) & (long_change["Group"]=="Placebo")]["Change"].notna().sum()
+            counts.append({"Visit": v, "N Active": int(nA), "N Placebo": int(nP)})
+        st.dataframe(pd.DataFrame(counts))
+
     st.subheader("4) Chart")
     chart_buf = make_chart(summary_df, valid_visits)
-    st.image(chart_buf, caption="Median change with IQR (Active vs Placebo)", use_column_width=True)
+    if chart_buf is None:
+        st.info("Chart skipped: not enough data to compute medians/IQR for both groups at any visit.")
+    else:
+        st.image(chart_buf, caption="Median change with IQR (Active vs Placebo)", use_column_width=True)
 
     # Build Excel in memory
     out = io.BytesIO()
@@ -405,8 +435,16 @@ if uploaded:
         rm_df.to_excel(writer, sheet_name="RM_NONPARAM_SUMMARY", index=False)
         within_df.to_excel(writer, sheet_name="WITHIN_GROUP_TESTS", index=False)
         ttests_df.to_excel(writer, sheet_name="TTESTS", index=False)
-        workbook  = writer.book; ws_chart  = workbook.add_worksheet("CHARTS"); writer.sheets["CHARTS"] = ws_chart
-        ws_chart.insert_image("B2", "chart.png", {"image_data": chart_buf})
+
+        # CHART sheet
+        workbook  = writer.book
+        ws_chart  = workbook.add_worksheet("CHARTS")
+        writer.sheets["CHARTS"] = ws_chart
+        if chart_buf is not None:
+            ws_chart.insert_image("B2", "chart.png", {"image_data": chart_buf})
+        else:
+            ws_chart.write("B2", "Chart unavailable: insufficient data in both groups at the selected visits.")
+
     out.seek(0)
 
     st.subheader("5) Download Excel with all tabs")
