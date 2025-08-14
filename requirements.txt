@@ -4,3 +4,5 @@ numpy
 scipy
 openpyxl
 xlsxwriter
+statsmodels
+matplotlib
