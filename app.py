@@ -17,35 +17,6 @@ st.caption(
     "paired Wilcoxon & paired t (within-group), Welch t on changes (between-group), "
     "and rank-based repeated-measures (Group, Time, Group×Time)."
 )
-import numpy as np
-
-def normalize_group(g):
-    if g is None:
-        return np.nan
-    s = str(g).strip().lower()
-
-    # Active aliases
-    active_aliases = {
-        "active", "treatment", "verum", "test",
-        "usplus", "us plus", "permixon"
-    }
-    placebo_aliases = {
-        "placebo"
-    }
-
-    if s in active_aliases:
-        return "Active"
-    if s in placebo_aliases:
-        return "Placebo"
-    return np.nan
-
-# ---- When building long from INPUT sheet ----
-inp_echo["Group"] = inp_echo["Group"].map(normalize_group)
-inp_echo = inp_echo[inp_echo["Group"].isin(["Active", "Placebo"])]
-
-# ---- When building long from CHANGE WIDE sheet ----
-use["Group"] = use["Group"].map(normalize_group)
-use = use[use["Group"].isin(["Active", "Placebo"])]
 
 # ------------------ Settings ------------------
 DEFAULT_VISITS = ["Day28", "Day56", "Day84"]
@@ -65,6 +36,28 @@ def infer_col(df, must_have=(), any_of=()):
         if all(m in lc for m in must_have) and (not any_of or any(a in lc for a in any_of)):
             return c
     return None
+
+def normalize_group(g):
+    """Map incoming labels to canonical 'Active' or 'Placebo'."""
+    if g is None:
+        return np.nan
+    s = str(g).strip().lower()
+
+    # Treat these as Active
+    active_aliases = {
+        "active", "treatment", "verum", "test",
+        "usplus", "us plus", "permixon"
+    }
+    # Treat these as Placebo
+    placebo_aliases = {
+        "placebo", "control", "ctrl", "ctl"
+    }
+
+    if s in active_aliases or s.startswith("act") or s.startswith("us") or s.startswith("ver"):
+        return "Active"
+    if s in placebo_aliases or s.startswith("plac") or s.startswith("cont"):
+        return "Placebo"
+    return np.nan
 
 def cliffs_delta(a, b):
     a, b = np.asarray(a), np.asarray(b)
@@ -119,8 +112,15 @@ def build_long_from_input(df, visits):
     inp_echo = df[[subj, grp, base] + list(visit_map.values())].copy()
     inp_echo.columns = ["Subject","Group","Baseline"] + visits
     inp_echo = inp_echo.dropna(subset=["Subject","Group"])
-    inp_echo["Group"] = inp_echo["Group"].astype(str).str.strip()
+
+    # Normalize group labels HERE (inside the function)
+    inp_echo["Group"] = inp_echo["Group"].map(normalize_group)
     inp_echo = inp_echo[inp_echo["Group"].isin(["Active","Placebo"])]
+
+    # Coerce to numeric (handles numbers stored as text)
+    inp_echo["Baseline"] = pd.to_numeric(inp_echo["Baseline"], errors="coerce")
+    for v in visits:
+        inp_echo[v] = pd.to_numeric(inp_echo[v], errors="coerce")
 
     # change-from-baseline
     chg_wide = inp_echo[["Subject","Group"]].copy()
@@ -171,8 +171,14 @@ def build_long_from_changewide(df, visits):
 
     use = df[[subj, grp] + list(vmap.values())].copy()
     use.columns = ["Subject","Group"] + visits
-    use["Group"] = use["Group"].astype(str).str.strip()
+
+    # Normalize group labels HERE (inside the function)
+    use["Group"] = use["Group"].map(normalize_group)
     use = use[use["Group"].isin(["Active","Placebo"])]
+
+    # Coerce to numeric
+    for v in visits:
+        use[v] = pd.to_numeric(use[v], errors="coerce")
 
     rows = []
     for _, r in use.iterrows():
@@ -188,7 +194,6 @@ def build_long_from_changewide(df, visits):
 
 # ---------- Core stats with robust RM patch ----------
 def compute_nonparam_between_and_rm(long_change, visits):
-    # Working copy
     lc = long_change.copy()
 
     # Keep only visits present AND with both groups represented
@@ -201,11 +206,9 @@ def compute_nonparam_between_and_rm(long_change, visits):
         if nA > 0 and nP > 0:
             valid_visits.append(v)
 
-    # Filter to valid visits only
     lc = lc[lc["Time"].isin(valid_visits)].copy()
     lc["Time"] = pd.Categorical(lc["Time"], categories=valid_visits, ordered=True)
 
-    # Rank-based RM (subject-blocked) — only if ≥2 valid time points
     if len(valid_visits) < 2:
         group_p = time_p = inter_p = np.nan
     else:
@@ -216,28 +219,23 @@ def compute_nonparam_between_and_rm(long_change, visits):
         time_p  = float(an.loc["C(Time)", "PR(>F)"])
         inter_p = float(an.loc["C(Group):C(Time)", "PR(>F)"])
 
-    # Per-visit tests (use same filtered visits)
     rows = []
     sumrows = []
     for v in valid_visits:
         a = lc.loc[(lc["Group"]=="Active") & (lc["Time"]==v), "Change"]
         p = lc.loc[(lc["Group"]=="Placebo") & (lc["Time"]==v), "Change"]
 
-        # Mann–Whitney
         U, mw_p = (np.nan, np.nan)
         if len(a)>0 and len(p)>0:
             U, mw_p = mannwhitneyu(a, p, alternative="two-sided")
 
-        # Brunner–Munzel (≥4 per group typical)
         bm_stat, bm_p = (np.nan, np.nan)
         if len(a)>3 and len(p)>3:
             bm_stat, bm_p = brunnermunzel(a, p, alternative="two-sided")
 
-        # Effect sizes
         d_cliff = cliffs_delta(a, p)
         hl = hodges_lehmann(a, p)
 
-        # Rank-biserial r (direction by median diff)
         r_rb = np.nan
         if len(a)>0 and len(p)>0 and not np.isnan(U):
             n1, n2 = len(a), len(p)
@@ -260,7 +258,6 @@ def compute_nonparam_between_and_rm(long_change, visits):
             "Rank-biserial r": float(r_rb) if r_rb==r_rb else np.nan,
         })
 
-        # Summary for chart (median & IQR)
         def qstats(x):
             if len(x)==0: return (np.nan, np.nan, np.nan, np.nan, np.nan)
             med = np.median(x); q1 = np.percentile(x, 25); q3 = np.percentile(x, 75)
@@ -285,7 +282,6 @@ def compute_nonparam_between_and_rm(long_change, visits):
     return pv_df, rm_df, summary_df, valid_visits
 
 def compute_within_group_tests(input_echo, visits):
-    """Within each group, paired Wilcoxon & paired t: Baseline vs each visit."""
     if input_echo is None or input_echo.empty:
         return pd.DataFrame()
     rows = []
@@ -322,7 +318,6 @@ def compute_within_group_tests(input_echo, visits):
     return pd.DataFrame(rows)
 
 def compute_ttests(long_change, visits):
-    """Between-group Welch t-tests on change-from-baseline per visit."""
     rows = []
     for v in visits:
         a = long_change.loc[(long_change["Group"]=="Active") & (long_change["Time"]==v), "Change"].dropna()
@@ -337,7 +332,6 @@ def compute_ttests(long_change, visits):
     return pd.DataFrame(rows)
 
 def make_chart(summary_df, visits):
-    # Guard: if summary is empty or missing required cols, return None
     required = {
         "Active_median","Active_minus","Active_plus",
         "Placebo_median","Placebo_minus","Placebo_plus","Time"
@@ -345,7 +339,6 @@ def make_chart(summary_df, visits):
     if summary_df is None or summary_df.empty or not required.issubset(set(summary_df.columns)):
         return None
 
-    # Ensure correct order / subset to visits actually present
     summary_df = summary_df.copy().set_index("Time").reindex(visits).reset_index()
 
     fig, ax = plt.subplots(figsize=(8,5))
@@ -485,4 +478,4 @@ if uploaded:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    st.caption("Notes: Group labels must be exactly 'Active' and 'Placebo'. Brunner–Munzel needs ≥4 observations per group per visit.")
+    st.caption("Notes: 'USPlus' and 'Permixon' are treated as Active. Group labels are normalized automatically. Brunner–Munzel needs ≥4 per group per visit.")
