@@ -8,15 +8,14 @@ from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 
 st.set_page_config(page_title="Nonparam P-Values (Active vs Placebo)", layout="wide")
-
 st.title("Nonparametric P-Values — Active vs Placebo")
 st.caption(
-    "Upload an Excel with either an **Input** sheet "
-    "(raw Baseline & Day 28/56/84 columns, e.g., QOL/IPSS) or a **Change Wide** sheet "
-    "(Day28_change/Day56_change/Day84_change). The app auto-detects layout, "
-    "computes Mann–Whitney, Brunner–Munzel, effect sizes (Cliff’s δ, Hodges–Lehmann), "
-    "paired Wilcoxon & paired t, Welch t on changes, and rank-based repeated-measures, "
-    "then returns a downloadable Excel with all tabs and a chart."
+    "Upload an Excel with either an **Input** sheet (raw Baseline & Day 28/56/84 columns, "
+    "e.g., QOL/IPSS/etc.) or a **Change Wide** sheet (Day28_change/Day56_change/Day84_change). "
+    "The app auto-detects layout, builds CHANGE_WIDE & SUMMARY, renders a chart, and computes "
+    "Mann–Whitney, Brunner–Munzel, effect sizes (Cliff’s δ, Hodges–Lehmann), "
+    "paired Wilcoxon & paired t (within-group), Welch t on changes (between-group), "
+    "and rank-based repeated-measures (Group, Time, Group×Time)."
 )
 
 # ------------------ Settings ------------------
@@ -31,6 +30,7 @@ with st.sidebar:
 def norm(s): return str(s).strip().lower()
 
 def infer_col(df, must_have=(), any_of=()):
+    """Find first column whose name contains all 'must_have' and any of 'any_of' (if provided)."""
     for c in df.columns:
         lc = norm(c)
         if all(m in lc for m in must_have) and (not any_of or any(a in lc for a in any_of)):
@@ -38,7 +38,7 @@ def infer_col(df, must_have=(), any_of=()):
     return None
 
 def cliffs_delta(a, b):
-    a = np.asarray(a); b = np.asarray(b)
+    a, b = np.asarray(a), np.asarray(b)
     m, n = len(a), len(b)
     if m == 0 or n == 0: return np.nan
     wins = 0
@@ -47,7 +47,7 @@ def cliffs_delta(a, b):
     return wins / (m * n)
 
 def hodges_lehmann(a, b):
-    a = np.asarray(a); b = np.asarray(b)
+    a, b = np.asarray(a), np.asarray(b)
     if len(a) == 0 or len(b) == 0: return np.nan
     diffs = a.reshape(-1,1) - b.reshape(1,-1)
     return float(np.median(diffs))
@@ -55,15 +55,29 @@ def hodges_lehmann(a, b):
 # ---------- Input -> CHANGE_WIDE ----------
 def build_long_from_input(df, visits):
     df = df.rename(columns=lambda x: str(x).strip())
-    subj = infer_col(df, ("subject","id")) or "Subject ID"
-    grp  = infer_col(df, ("group",)) or "Group"
-    base = infer_col(df, ("baseline",)) or infer_col(df, ("base",))
-    if not base:
-        return None, None, None, "Baseline column not found."
 
+    # Subject detection (be lenient)
+    subj = (infer_col(df, ("subject",)) or
+            infer_col(df, ("participant","id")) or
+            infer_col(df, ("subject","id")) or
+            infer_col(df, ("id",)) or
+            "Subject")
+    grp  = infer_col(df, ("group",)) or "Group"
+
+    # Baseline detection: accept "baseline" / "base" / "BL_" variants
+    base = (infer_col(df, ("baseline",)) or
+            infer_col(df, ("base",)) or
+            infer_col(df, ("bl_",)) or
+            infer_col(df, ("bl ",)) or
+            infer_col(df, (" bl",)) or
+            infer_col(df, ("bl",)))
+    if not base:
+        return None, None, None, "Baseline column not found (looked for baseline/base/BL_)."
+
+    # Visit columns: look for day markers; trailing metric text can be anything
     visit_map = {}
     for v in visits:
-        aliases = [v.lower(), v.lower().replace("day","day ")]
+        aliases = [v.lower(), v.lower().replace("day","day ")]  # day28 / day 28
         col = None
         for c in df.columns:
             lc = norm(c)
@@ -79,28 +93,35 @@ def build_long_from_input(df, visits):
     inp_echo["Group"] = inp_echo["Group"].astype(str).str.strip()
     inp_echo = inp_echo[inp_echo["Group"].isin(["Active","Placebo"])]
 
+    # change-from-baseline
     chg_wide = inp_echo[["Subject","Group"]].copy()
     for v in visits:
         chg_wide[f"{v}_change"] = inp_echo[v] - inp_echo["Baseline"]
 
+    # long format for RM and per-visit tests
     rows = []
     for _, r in chg_wide.iterrows():
         for v in visits:
-            val = r[f"{v}_change"]
+            val = r.get(f"{v}_change")
             if pd.notna(val):
                 rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v, "Change": float(val)})
     long_change = pd.DataFrame(rows)
     if long_change.empty:
         return None, None, None, "No change values computed."
     long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
-
     return long_change, chg_wide.copy(), inp_echo.copy(), None
 
 # ---------- CHANGE_WIDE (already) ----------
 def build_long_from_changewide(df, visits):
     df = df.rename(columns=lambda x: str(x).strip())
-    subj = infer_col(df, ("subject","id")) or "Subject ID"
+
+    subj = (infer_col(df, ("subject",)) or
+            infer_col(df, ("participant","id")) or
+            infer_col(df, ("subject","id")) or
+            infer_col(df, ("id",)) or
+            "Subject")
     grp  = infer_col(df, ("group",)) or "Group"
+
     change_words = ("change","delta","diff")
     vmap = {}
     for v in visits:
@@ -136,34 +157,58 @@ def build_long_from_changewide(df, visits):
     long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
     return long_change, use.copy(), None
 
-# ---------- Core stats ----------
+# ---------- Core stats with robust RM patch ----------
 def compute_nonparam_between_and_rm(long_change, visits):
-    # Rank-based RM (subject-blocked)
-    long_change = long_change.copy()
-    long_change["rank_change"] = long_change["Change"].rank(method="average")
-    model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=long_change).fit()
-    an = anova_lm(model, typ=3)
-    group_p = float(an.loc["C(Group)", "PR(>F)"])
-    time_p  = float(an.loc["C(Time)", "PR(>F)"])
-    inter_p = float(an.loc["C(Group):C(Time)", "PR(>F)"])
+    # Make a working copy
+    lc = long_change.copy()
 
+    # Keep only visits present AND with both groups represented
+    observed_times = lc["Time"].dropna().astype(str).unique().tolist()
+    observed_times = [v for v in visits if v in observed_times]
+    valid_visits = []
+    for v in observed_times:
+        nA = lc[(lc["Time"] == v) & (lc["Group"] == "Active")].shape[0]
+        nP = lc[(lc["Time"] == v) & (lc["Group"] == "Placebo")].shape[0]
+        if nA > 0 and nP > 0:
+            valid_visits.append(v)
+
+    # Filter to valid visits only
+    lc = lc[lc["Time"].isin(valid_visits)].copy()
+    lc["Time"] = pd.Categorical(lc["Time"], categories=valid_visits, ordered=True)
+
+    # Rank-based RM (subject-blocked) — only if ≥2 valid time points
+    if len(valid_visits) < 2:
+        group_p = time_p = inter_p = np.nan
+    else:
+        lc["rank_change"] = lc["Change"].rank(method="average")
+        model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=lc).fit()
+        an = anova_lm(model, typ=3)
+        group_p = float(an.loc["C(Group)", "PR(>F)"])
+        time_p  = float(an.loc["C(Time)", "PR(>F)"])
+        inter_p = float(an.loc["C(Group):C(Time)", "PR(>F)"])
+
+    # Per-visit tests (use the same filtered set of visits)
     rows = []
     sumrows = []
-    for v in visits:
-        a = long_change.loc[(long_change["Group"]=="Active") & (long_change["Time"]==v), "Change"]
-        p = long_change.loc[(long_change["Group"]=="Placebo") & (long_change["Time"]==v), "Change"]
+    for v in valid_visits:
+        a = lc.loc[(lc["Group"]=="Active") & (lc["Time"]==v), "Change"]
+        p = lc.loc[(lc["Group"]=="Placebo") & (lc["Time"]==v), "Change"]
 
+        # Mann–Whitney
         U, mw_p = (np.nan, np.nan)
         if len(a)>0 and len(p)>0:
             U, mw_p = mannwhitneyu(a, p, alternative="two-sided")
 
+        # Brunner–Munzel (≥4 per group typical)
         bm_stat, bm_p = (np.nan, np.nan)
         if len(a)>3 and len(p)>3:
             bm_stat, bm_p = brunnermunzel(a, p, alternative="two-sided")
 
+        # Effect sizes
         d_cliff = cliffs_delta(a, p)
         hl = hodges_lehmann(a, p)
 
+        # Rank-biserial r (direction by median diff)
         r_rb = np.nan
         if len(a)>0 and len(p)>0 and not np.isnan(U):
             n1, n2 = len(a), len(p)
@@ -186,12 +231,10 @@ def compute_nonparam_between_and_rm(long_change, visits):
             "Rank-biserial r": float(r_rb) if r_rb==r_rb else np.nan,
         })
 
-        # Summary for chart
+        # Summary for chart (median & IQR)
         def qstats(x):
             if len(x)==0: return (np.nan, np.nan, np.nan, np.nan, np.nan)
-            med = np.median(x)
-            q1  = np.percentile(x, 25)
-            q3  = np.percentile(x, 75)
+            med = np.median(x); q1 = np.percentile(x, 25); q3 = np.percentile(x, 75)
             return med, q1, q3, (q3-med), (med-q1)
 
         amed, aq1, aq3, aplus, aminus = qstats(a)
@@ -206,11 +249,11 @@ def compute_nonparam_between_and_rm(long_change, visits):
 
     pv_df = pd.DataFrame(rows)
     rm_df = pd.DataFrame({
-        "Effect": ["Group (Active vs Placebo)", f"Time ({', '.join(visits)})", "Group × Time interaction"],
+        "Effect": ["Group (Active vs Placebo)", f"Time ({', '.join(valid_visits)})", "Group × Time interaction"],
         "p-value": [group_p, time_p, inter_p]
     })
     summary_df = pd.DataFrame(sumrows)
-    return pv_df, rm_df, summary_df
+    return pv_df, rm_df, summary_df, valid_visits
 
 def compute_within_group_tests(input_echo, visits):
     """Within each group, paired Wilcoxon & paired t: Baseline vs each visit."""
@@ -221,8 +264,12 @@ def compute_within_group_tests(input_echo, visits):
         g = input_echo[input_echo["Group"] == grp]
         base = g["Baseline"]
         for v in visits:
-            follow = g[v]
-            # drop pairs with any NaN
+            follow = g[v] if v in g.columns else None
+            if follow is None: 
+                rows.append({"Group": grp, "Visit": v, "N (paired)": 0,
+                             "Wilcoxon stat": np.nan, "Wilcoxon p": np.nan,
+                             "Paired t stat": np.nan, "Paired t p": np.nan})
+                continue
             paired = pd.concat([base, follow], axis=1).dropna()
             if paired.shape[0] == 0:
                 w_stat = w_p = t_stat = t_p = np.nan
@@ -236,8 +283,7 @@ def compute_within_group_tests(input_echo, visits):
                 except Exception:
                     t_stat, t_p = (np.nan, np.nan)
             rows.append({
-                "Group": grp, "Visit": v,
-                "N (paired)": int(paired.shape[0]),
+                "Group": grp, "Visit": v, "N (paired)": int(paired.shape[0]),
                 "Wilcoxon stat": float(w_stat) if w_stat==w_stat else np.nan,
                 "Wilcoxon p": float(w_p) if w_p==w_p else np.nan,
                 "Paired t stat": float(t_stat) if t_stat==t_stat else np.nan,
@@ -246,13 +292,13 @@ def compute_within_group_tests(input_echo, visits):
     return pd.DataFrame(rows)
 
 def compute_ttests(long_change, visits):
-    """Between-group Welch t-tests on change-from-baseline (Active vs Placebo) per visit."""
+    """Between-group Welch t-tests on change-from-baseline per visit."""
     rows = []
     for v in visits:
         a = long_change.loc[(long_change["Group"]=="Active") & (long_change["Time"]==v), "Change"].dropna()
         p = long_change.loc[(long_change["Group"]=="Placebo") & (long_change["Time"]==v), "Change"].dropna()
         if len(a)>1 and len(p)>1:
-            t_stat, t_p = ttest_ind(a, p, equal_var=False)  # Welch
+            t_stat, t_p = ttest_ind(a, p, equal_var=False)
         else:
             t_stat, t_p = (np.nan, np.nan)
         rows.append({"Visit": v, "N Active": int(len(a)), "N Placebo": int(len(p)),
@@ -331,9 +377,9 @@ if uploaded:
     st.dataframe(long_change.head(10))
 
     st.subheader("3) Compute tests")
-    pv_df, rm_df, summary_df = compute_nonparam_between_and_rm(long_change, VISITS)
-    within_df = compute_within_group_tests(input_echo, VISITS)  # will be empty if you uploaded Change Wide only
-    ttests_df = compute_ttests(long_change, VISITS)
+    pv_df, rm_df, summary_df, valid_visits = compute_nonparam_between_and_rm(long_change, VISITS)
+    within_df = compute_within_group_tests(input_echo, valid_visits if input_echo is not None else valid_visits)
+    ttests_df = compute_ttests(long_change, valid_visits)
 
     c1, c2 = st.columns(2)
     with c1: st.markdown("**P_VALUES (between-group, nonparam + effect sizes)**"); st.dataframe(pv_df)
@@ -346,7 +392,7 @@ if uploaded:
     st.dataframe(ttests_df)
 
     st.subheader("4) Chart")
-    chart_buf = make_chart(summary_df, VISITS)
+    chart_buf = make_chart(summary_df, valid_visits)
     st.image(chart_buf, caption="Median change with IQR (Active vs Placebo)", use_column_width=True)
 
     # Build Excel in memory
