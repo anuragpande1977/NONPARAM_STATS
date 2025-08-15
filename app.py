@@ -1,4 +1,4 @@
-import io, re
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -7,124 +7,17 @@ from scipy.stats import mannwhitneyu, brunnermunzel, ttest_rel, ttest_ind, wilco
 from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 
-st.set_page_config(page_title="Flexible Nonparametrics — Pairwise + Repeated Measures", layout="wide")
-st.title("Flexible Nonparametric Analysis — Pairwise (A vs B) + Repeated Measures")
+st.set_page_config(page_title="Nonparam P-Values — Pairwise + Repeated Measures", layout="wide")
+st.title("Nonparametric Analysis — Pairwise (USPlus vs Placebo) + Repeated Measures")
 st.caption(
-    "Upload an Excel workbook. The app auto-detects: (1) the outcome series (e.g., Ejaculation score, AM/PM), "
-    "(2) Baseline column, and (3) any number of follow-up timepoints (Days/Weeks/Months/Visits, including Day 85). "
-    "If change columns (e.g., 'Change AM') exist, they will be used directly; otherwise change is computed from baseline."
+    "Upload an Excel with raw columns (Baseline & Day 28/56/85). "
+    "Pick the outcome (e.g., Ejaculation/Erection). Map columns if headers differ. "
+    "Pairwise is forced to USPlus vs Placebo when both are present."
 )
 
 # ---------- Helpers ----------
 def norm(s): return str(s).strip().lower()
-
-def infer_col(df, must_have=(), any_of=()):
-    for c in df.columns:
-        lc = norm(c)
-        if all(m in lc for m in must_have) and (not any_of or any(a in lc for a in any_of)):
-            return c
-    return None
-
-SUBJ_CANDIDATES = [
-    ("participant","id"), ("subject","id"), ("subject",), ("participant",), ("patient","id"), ("id",)
-]
-GRP_CANDIDATES = [("group",), ("arm",), ("treatment",), ("grp",), ("group_norm",)]
-
-BASELINE_TOKENS = [
-    "baseline", "base", "bl", "bl_", " bl", "bl "
-]
-
-# Regex recognizers for visits/time
-TIME_PATTERNS = [
-    (re.compile(r"\bday\s*(\d+)\b", re.I), lambda m: ("Day", int(m.group(1)), f"Day{m.group(1)}")),
-    (re.compile(r"\bweek\s*(\d+)\b", re.I), lambda m: ("Week", int(m.group(1)), f"Week{m.group(1)}")),
-    (re.compile(r"\b(\d+)\s*month(s)?\b", re.I), lambda m: ("Month", int(m.group(1)), f"Month{m.group(1)}")),
-    (re.compile(r"\bvisit\s*(\d+)\b", re.I), lambda m: ("Visit", int(m.group(1)), f"Visit{m.group(1)}")),
-    (re.compile(r"\bm(\d+)\b", re.I),     lambda m: ("Month", int(m.group(1)), f"Month{m.group(1)}")),  # e.g., M1
-    (re.compile(r"\bv(\d+)\b", re.I),     lambda m: ("Visit", int(m.group(1)), f"Visit{m.group(1)}")),
-]
-
-CHANGE_TOKENS = ["change", "delta", "diff"]
-
-def detect_subject_col(df):
-    for keys in SUBJ_CANDIDATES:
-        c = infer_col(df, keys)
-        if c: return c
-    # last resort
-    return df.columns[0]
-
-def detect_group_col(df):
-    for keys in GRP_CANDIDATES:
-        c = infer_col(df, keys)
-        if c: return c
-    # fallback if missing
-    return None
-
-def is_change_col(colname):
-    lc = norm(colname)
-    return any(tok in lc for tok in CHANGE_TOKENS)
-
-def is_baseline_col(colname):
-    lc = norm(colname)
-    return any(tok in lc for tok in BASELINE_TOKENS)
-
-def parse_time_label(text):
-    """Return (order_key_tuple, canonical_label) or (None, None)."""
-    s = str(text)
-    for pat, maker in TIME_PATTERNS:
-        m = pat.search(s)
-        if m:
-            kind, num, label = maker(m)
-            # order as (priority, number) where Day < Week < Month < Visit for stability
-            priority = {"Day":1, "Week":2, "Month":3, "Visit":4}.get(kind, 9)
-            return (priority, num), label
-    return (None, None)
-
-def stem_for_series(colname):
-    """Produce a series stem by removing baseline/time tokens, keeping the 'measure' part.
-       E.g. 'Day 56 Ejaculation Score (0-8)' -> 'Ejaculation Score (0-8)' ;
-            '1 Month AM Average' -> 'AM Average' ; 'Change AM' -> 'AM' with flag.
-    """
-    s = colname
-    s = re.sub(r"\bday\s*\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\bweek\s*\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\b(\d+)\s*month(s)?\b", "", s, flags=re.I)
-    s = re.sub(r"\bvisit\s*\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\bm\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\bv\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\bbaseline\b", "", s, flags=re.I)
-    s = re.sub(r"\bbase\b", "", s, flags=re.I)
-    s = re.sub(r"\bbl_?\b", "", s, flags=re.I)
-    s = s.replace("_", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def collect_series(df):
-    """Group columns into 'series' candidates: each series has optional baseline, zero+ follow-ups, and/or change cols."""
-    series = {}
-    for c in df.columns:
-        if c is None: continue
-        s_stem = stem_for_series(str(c))
-        if s_stem == "": continue
-        series.setdefault(s_stem, {"baseline": [], "followups": [], "changes": []})
-        if is_baseline_col(c):
-            series[s_stem]["baseline"].append(c)
-        elif is_change_col(c):
-            series[s_stem]["changes"].append(c)
-        else:
-            order, label = parse_time_label(c)
-            if order is not None:
-                series[s_stem]["followups"].append((order, label, c))
-            else:
-                # leave non-time, non-baseline, non-change columns alone
-                pass
-    # sort follow-ups
-    for s_stem in series:
-        series[s_stem]["followups"].sort(key=lambda t: (t[0][0], t[0][1]))
-    return series
-
-def to_numeric_safe(s):
-    return pd.to_numeric(s, errors="coerce")
+def to_num(s): return pd.to_numeric(s, errors="coerce")
 
 def cliffs_delta(a, b):
     a, b = np.asarray(a), np.asarray(b)
@@ -141,114 +34,17 @@ def hodges_lehmann(a, b):
     diffs = a.reshape(-1,1) - b.reshape(1,-1)
     return float(np.median(diffs))
 
-# ---------- Builders ----------
-def build_from_series(df, subj_col, group_col, series_entry, chosen_series_name):
-    """
-    Return long_change, change_wide, input_echo (if baseline path), visits(list), diag_msg(str or None)
-    Logic:
-      - If change columns exist and no clear baseline/follow-ups: use change columns directly (single timepoint 'Change').
-      - Else compute change per follow-up: change = followup - baseline.
-    """
-    # sanitize
-    df = df.rename(columns=lambda x: str(x).strip())
-    subj = subj_col
-    grp  = group_col
+def guess_col(df_cols, keywords):
+    """Return first column whose lowercase name contains ALL keywords."""
+    for c in df_cols:
+        lc = norm(c)
+        if all(k in lc for k in keywords):
+            return c
+    return None
 
-    # validate subj/group existence
-    cols_needed = [subj] + ([grp] if grp else [])
-    for c in cols_needed:
-        if c not in df.columns:
-            return None, None, None, [], f"Column '{c}' not found."
-
-    # figure out baseline + followups + changes
-    baselist = series_entry.get("baseline", [])
-    followups = series_entry.get("followups", [])
-    changes = series_entry.get("changes", [])
-
-    # Strategy A: direct changes available (e.g., 'Change AM', 'Change PM')
-    if len(changes) >= 1 and len(baselist) == 0 and len(followups) == 0:
-        # Build change-wide with those columns as timepoints (label them as provided)
-        cw = df[[subj] + ([grp] if grp else []) + changes].copy()
-        cw.columns = ["Subject"] + (["Group"] if grp else []) + [c for c in changes]
-        # long
-        rows = []
-        for _, r in cw.iterrows():
-            for c in changes:
-                v = r.get(c)
-                if pd.notna(v):
-                    rows.append({
-                        "Subject": r["Subject"],
-                        "Group": r["Group"] if grp else "All",
-                        "Time": c,  # treat each change column name as a 'time' label
-                        "Change": float(v)
-                    })
-        long_change = pd.DataFrame(rows)
-        visits = [c for c in changes]  # preserve order
-        long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
-        return long_change, cw, None, visits, None
-
-    # Strategy B: compute change from baseline across available follow-ups
-    # pick ONE baseline if multiple candidates; prefer the one that best matches the series name
-    baseline_col = None
-    if baselist:
-        # heuristic: choose baseline whose stem is closest to chosen_series_name
-        candidates = []
-        for b in baselist:
-            bstem = stem_for_series(b)
-            # score: shorter distance = better
-            score = 0 if norm(bstem) == norm(chosen_series_name) else 1
-            candidates.append((score, b))
-        candidates.sort(key=lambda x: x[0])
-        baseline_col = candidates[0][1]
-    else:
-        return None, None, None, [], "No baseline column detected for the chosen series."
-
-    if not followups:
-        return None, None, None, [], "No follow-up timepoints detected for the chosen series."
-
-    # Build input_echo: Baseline + followups (raw)
-    use_cols = [subj] + ([grp] if grp else []) + [baseline_col] + [c for _,_,c in followups]
-    inp = df[use_cols].copy()
-    rename_map = {subj:"Subject"}
-    if grp: rename_map[grp] = "Group"
-    rename_map[baseline_col] = "Baseline"
-    # canonical visit names (labels from parser)
-    visits = [lbl for _,lbl,_ in followups]
-    for (_, lbl, c) in followups:
-        rename_map[c] = lbl
-    inp = inp.rename(columns=rename_map)
-    if grp:
-        inp["Group"] = inp["Group"].astype(str).str.strip()
-
-    # numeric force
-    for c in ["Baseline"] + visits:
-        inp[c] = to_numeric_safe(inp[c])
-
-    # change-wide
-    chg_wide = inp[["Subject"] + (["Group"] if grp else [])].copy()
-    for v in visits:
-        chg_wide[f"{v}_change"] = inp[v] - inp["Baseline"]
-
-    # long
-    rows = []
-    for _, r in chg_wide.iterrows():
-        for v in visits:
-            val = r.get(f"{v}_change")
-            if pd.notna(val):
-                rows.append({
-                    "Subject": r["Subject"],
-                    "Group": r["Group"] if grp else "All",
-                    "Time": v,
-                    "Change": float(val)
-                })
-    long_change = pd.DataFrame(rows)
-    long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
-    return long_change, chg_wide, inp, visits, None
-
-# ---------- Stats ----------
 def compute_rm_all_groups(long_change, visits):
     lc = long_change.copy()
-    lc["Change"] = to_numeric_safe(lc["Change"])
+    lc["Change"] = to_num(lc["Change"])
     lc = lc.dropna(subset=["Group","Time","Change"]).copy()
     observed = [v for v in visits if v in lc["Time"].astype(str).unique().tolist()]
     if len(observed) < 2:
@@ -258,7 +54,6 @@ def compute_rm_all_groups(long_change, visits):
         }), observed
 
     lc["rank_change"] = lc["Change"].rank(method="average")
-    # subject random effect approximated via fixed effect in rank-based ANOVA
     model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=lc).fit()
     an = anova_lm(model, typ=3)
     rm_df = pd.DataFrame({
@@ -273,7 +68,7 @@ def compute_rm_all_groups(long_change, visits):
 
 def compute_pairwise_between(long_change, visits, group_a, group_b):
     lc = long_change[long_change["Group"].isin([group_a, group_b])].copy()
-    lc["Change"] = to_numeric_safe(lc["Change"])
+    lc["Change"] = to_num(lc["Change"])
     lc = lc.dropna(subset=["Change","Time","Group"]).copy()
 
     valid, diag = [], []
@@ -331,27 +126,23 @@ def compute_pairwise_between(long_change, visits, group_a, group_b):
             f"{group_b}_plus": bplus, f"{group_b}_minus": bminus
         })
 
-    pv_df = pd.DataFrame(rows)
-    summary_df = pd.DataFrame(sumrows)
-    diag_df = pd.DataFrame(diag)
-    return pv_df, summary_df, valid, diag_df
+    return pd.DataFrame(rows), pd.DataFrame(sumrows), valid, pd.DataFrame(diag)
 
 def compute_within_group_tests(input_echo, visits):
     if input_echo is None or input_echo.empty:
         return pd.DataFrame()
-    groups = (input_echo["Group"].dropna().astype(str).str.strip().unique().tolist()
-              if "Group" in input_echo.columns else ["All"])
+    groups = sorted(input_echo["Group"].dropna().astype(str).str.strip().unique().tolist())
     rows = []
     for grp in groups:
-        g = input_echo if "Group" not in input_echo.columns else input_echo[input_echo["Group"] == grp]
-        base = to_numeric_safe(g["Baseline"])
+        g = input_echo[input_echo["Group"] == grp]
+        base = to_num(g["Baseline"])
         for v in visits:
             if v not in g.columns:
                 rows.append({"Group": grp, "Visit": v, "N (paired)": 0,
                              "Wilcoxon stat": np.nan, "Wilcoxon p": np.nan,
                              "Paired t stat": np.nan, "Paired t p": np.nan})
                 continue
-            follow = to_numeric_safe(g[v])
+            follow = to_num(g[v])
             paired = pd.concat([base, follow], axis=1).dropna()
             if paired.shape[0] == 0:
                 w_stat = w_p = t_stat = t_p = np.nan
@@ -419,131 +210,166 @@ def make_chart(summary_df, visits, group_a, group_b):
 
 # ---------- UI ----------
 st.subheader("1) Upload your Excel (.xlsx)")
-uploaded = st.file_uploader("Upload a workbook (any sheet). The app will scan columns and infer series/visits.", type=["xlsx"])
-
+uploaded = st.file_uploader("Workbook with an 'Input-like' sheet (raw BL + Day 28/56/85).", type=["xlsx"])
 if not uploaded:
     st.stop()
 
 try:
-    # Read first sheet just to list columns; we will actually scan all sheets
     xl = pd.ExcelFile(uploaded)
 except Exception as e:
     st.error(f"Could not read Excel: {e}")
     st.stop()
 
-# Pick a sheet
 sheet = st.selectbox("Choose sheet", xl.sheet_names, index=0)
 df = pd.read_excel(uploaded, sheet_name=sheet)
 st.write("Preview:")
 st.dataframe(df.head(8))
 
-# Detect subject / group
-subj_col = detect_subject_col(df)
-grp_col  = detect_group_col(df)
+# Basic IDs
+# Try to guess subject and group columns
+subj_guess = None
+for cand in ["Participant ID","Subject ID","Subject","ID","Participant","Patient ID","Patient"]:
+    if cand in df.columns: subj_guess = cand; break
+if subj_guess is None: subj_guess = df.columns[0]
+
+grp_guess = None
+for cand in ["GROUP","Group","Arm","Treatment","group"]:
+    if cand in df.columns: grp_guess = cand; break
+
 with st.sidebar:
     st.header("Column mapping")
-    subj_col = st.selectbox("Subject ID column", df.columns.tolist(), index=df.columns.get_loc(subj_col) if subj_col in df.columns else 0)
-    grp_col = st.selectbox("Group column (or 'None' if absent)", ["<None>"] + df.columns.tolist(), index=(0 if (not grp_col or grp_col not in df.columns) else df.columns.get_loc(grp_col)+1))
-    if grp_col == "<None>": grp_col = None
+    subj_col = st.selectbox("Subject ID column", df.columns.tolist(), index=df.columns.get_loc(subj_guess))
+    grp_col = st.selectbox("Group column", df.columns.tolist(), index=(df.columns.get_loc(grp_guess) if grp_guess in df.columns else 0))
 
-# Build series options
-series = collect_series(df)
-if not series:
-    st.error("Could not detect any outcome series (no baseline/visit/change patterns found).")
-    st.stop()
-
-series_names = sorted(series.keys())
+# Outcome focus
 with st.sidebar:
-    st.header("Outcome series")
-    chosen_series = st.selectbox("Pick the outcome series to analyze", series_names, index=0)
+    st.header("Outcome")
+    # common quick options + custom
+    quick = st.selectbox("Pick outcome keyword", ["Ejaculation", "Erection", "Custom"], index=0)
+    if quick == "Custom":
+        outcome_kw = st.text_input("Enter key word to search in headers (e.g., 'IPSS', 'Frequency', 'QoL')", "Ejaculation")
+    else:
+        outcome_kw = quick
 
-series_entry = series[chosen_series]
-st.markdown(f"**Detected series:** `{chosen_series}`")
-st.write({
-    "Baseline candidates": series_entry.get("baseline", []),
-    "Follow-ups": [f"{lbl} ← {col}" for _,lbl,col in series_entry.get("followups", [])],
-    "Change cols": series_entry.get("changes", []),
-})
+# Try to guess columns for BL / visits based on the outcome keyword
+cols = df.columns.tolist()
+bl_guess   = (guess_col(cols, ["bl", norm(outcome_kw)]) or guess_col(cols, ["baseline", norm(outcome_kw)]))
+d28_guess  = guess_col(cols, ["day", "28", norm(outcome_kw)])
+d56_guess  = guess_col(cols, ["day", "56", norm(outcome_kw)])
+d84_guess  = guess_col(cols, ["day", "84", norm(outcome_kw)])  # may be absent
+d85_guess  = guess_col(cols, ["day", "85", norm(outcome_kw)])  # some sheets use Day 85
 
-# Build long/change from the chosen series
-long_change, change_wide, input_echo, VISITS, err = build_from_series(df, subj_col, grp_col, series_entry, chosen_series)
-if err:
-    st.error(err)
+# UI to override mapping
+st.subheader("2) Map outcome columns")
+col1, col2 = st.columns(2)
+with col1:
+    bl_col  = st.selectbox("Baseline column", ["<None>"] + cols, index=(cols.index(bl_guess)+1 if bl_guess in cols else 0))
+with col2:
+    d28_col = st.selectbox("Day 28 column", ["<None>"] + cols, index=(cols.index(d28_guess)+1 if d28_guess in cols else 0))
+
+col3, col4 = st.columns(2)
+with col3:
+    d56_col = st.selectbox("Day 56 column", ["<None>"] + cols, index=(cols.index(d56_guess)+1 if d56_guess in cols else 0))
+with col4:
+    # prefer Day 85, otherwise Day 84
+    d85_col = st.selectbox("Day 85 (or 84) column", ["<None>"] + cols,
+                           index=(cols.index(d85_guess)+1 if d85_guess in cols else (cols.index(d84_guess)+1 if d84_guess in cols else 0)))
+
+mapped = {
+    "Baseline": None if bl_col=="<None>" else bl_col,
+    "Day28": None if d28_col=="<None>" else d28_col,
+    "Day56": None if d56_col=="<None>" else d56_col,
+    "Day85": None if d85_col=="<None>" else d85_col,
+}
+VISITS = [v for v in ["Day28","Day56","Day85"] if mapped[v] is not None]
+
+if mapped["Baseline"] is None or len(VISITS)==0:
+    st.error("Please map at least a Baseline and one follow-up (Day 28/56/85).")
     st.stop()
 
-# Available groups
+# Build INPUT_ECHO and CHANGE_WIDE
+inp = df[[subj_col, grp_col, mapped["Baseline"]] + [mapped[v] for v in VISITS]].copy()
+rename_map = {subj_col:"Subject", grp_col:"Group", mapped["Baseline"]:"Baseline"}
+for v in VISITS:
+    rename_map[mapped[v]] = v
+inp = inp.rename(columns=rename_map)
+inp["Group"] = inp["Group"].astype(str).str.strip()
+for c in ["Baseline"] + VISITS:
+    inp[c] = to_num(inp[c])
+
+change_wide = inp[["Subject","Group"]].copy()
+for v in VISITS:
+    change_wide[f"{v}_change"] = inp[v] - inp["Baseline"]
+
+# Long format
+rows = []
+for _, r in change_wide.iterrows():
+    for v in VISITS:
+        val = r.get(f"{v}_change")
+        if pd.notna(val):
+            rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v, "Change": float(val)})
+long_change = pd.DataFrame(rows)
+long_change["Time"] = pd.Categorical(long_change["Time"], categories=VISITS, ordered=True)
+
+# Restrict pair to USPlus vs Placebo when possible
 all_groups = sorted(long_change["Group"].dropna().astype(str).str.strip().unique().tolist())
+if {"USPlus","Placebo"}.issubset(set(all_groups)):
+    group_a, group_b = "USPlus", "Placebo"
+else:
+    # fallback to first two
+    group_a, group_b = (all_groups + all_groups)[:2]  # safe even if 1 group
+
 with st.sidebar:
     st.header("Pairwise comparison")
-    if len(all_groups) < 1:
-        st.error("No groups detected.")
-        st.stop()
-    if len(all_groups) == 1:
-        group_a = all_groups[0]
-        group_b = all_groups[0]
-        st.info(f"Only one group detected: {group_a}. Pairwise tests will be limited.")
-    else:
-        default_pair = (all_groups[0], all_groups[1])
-        group_a = st.selectbox("Group A", all_groups, index=all_groups.index(default_pair[0]))
-        group_b = st.selectbox("Group B", all_groups, index=all_groups.index(default_pair[1]))
-        if group_a == group_b:
-            st.warning("Pick two different groups for pairwise tests.")
+    st.write("Locked to **USPlus vs Placebo** when both exist.")
+    group_a = st.selectbox("Group A", all_groups, index=all_groups.index(group_a) if group_a in all_groups else 0)
+    group_b = st.selectbox("Group B", all_groups, index=all_groups.index(group_b) if group_b in all_groups else (1 if len(all_groups)>1 else 0))
+    if group_a == group_b:
+        st.warning("Pick two different groups for pairwise tests.")
 
-st.subheader("2) Long-format 'Change' (preview)")
+st.subheader("3) Long-format change (preview)")
 st.dataframe(long_change.head(10))
 
-# RM across ALL groups (only if >=2 timepoints)
-st.subheader("3) Repeated-measures across ALL groups")
+# RM across ALL groups
+st.subheader("4) Repeated-measures across ALL groups")
 rm_df, observed = compute_rm_all_groups(long_change, VISITS)
 st.dataframe(rm_df)
 
 # Pairwise between-group tests
-if len(all_groups) >= 2 and group_a != group_b:
-    st.subheader(f"4) Pairwise between-group tests — {group_a} vs {group_b}")
-    pv_df, summary_df, valid_visits, diag_df = compute_pairwise_between(long_change, VISITS, group_a, group_b)
-    st.markdown("**P_VALUES (per visit)**")
-    st.dataframe(pv_df)
+st.subheader(f"5) Pairwise between-group tests — {group_a} vs {group_b}")
+pv_df, summary_df, valid_visits, diag_df = compute_pairwise_between(long_change, VISITS, group_a, group_b)
+st.markdown("**P_VALUES (per visit)**")
+st.dataframe(pv_df)
+with st.expander("Diagnostics (per-visit Ns for selected pair)"):
+    st.dataframe(diag_df)
 
-    with st.expander("Diagnostics (per-visit Ns for selected pair)"):
-        st.dataframe(diag_df)
+# Add final-visit Mann–Whitney to RM table
+if len(valid_visits) > 0:
+    final_visit = valid_visits[-1]
+    a_final = long_change[(long_change["Group"]==group_a) & (long_change["Time"]==final_visit)]["Change"].dropna()
+    b_final = long_change[(long_change["Group"]==group_b) & (long_change["Time"]==final_visit)]["Change"].dropna()
+    if len(a_final)>0 and len(b_final)>0:
+        _, mw_p_final = mannwhitneyu(a_final, b_final, alternative="two-sided")
+        rm_df = pd.concat([rm_df, pd.DataFrame({
+            "Effect": [f"Final visit Mann–Whitney ({group_a} vs {group_b}) at {final_visit}"],
+            "p-value": [float(mw_p_final)]
+        })], ignore_index=True)
+        st.markdown("**RM_NONPARAM_SUMMARY (with final-visit MW)**")
+        st.dataframe(rm_df)
 
-    # Final-visit MW added to RM table (primary endpoint for selected pair)
-    if len(valid_visits) > 0:
-        final_visit = valid_visits[-1]
-        a_final = long_change[(long_change["Group"]==group_a) & (long_change["Time"]==final_visit)]["Change"].dropna()
-        b_final = long_change[(long_change["Group"]==group_b) & (long_change["Time"]==final_visit)]["Change"].dropna()
-        if len(a_final)>0 and len(b_final)>0:
-            _, mw_p_final = mannwhitneyu(a_final, b_final, alternative="two-sided")
-            rm_df = pd.concat([rm_df, pd.DataFrame({
-                "Effect": [f"Final visit Mann–Whitney ({group_a} vs {group_b}) at {final_visit}"],
-                "p-value": [float(mw_p_final)]
-            })], ignore_index=True)
-            st.markdown("**RM_NONPARAM_SUMMARY (with final-visit MW for selected pair)**")
-            st.dataframe(rm_df)
-        else:
-            st.info("Final-visit Mann–Whitney not added: one of the groups has no data at the final visit.")
-else:
-    pv_df = pd.DataFrame()
-    summary_df = pd.DataFrame()
-    valid_visits = []
-    st.info("Pairwise tests require two distinct groups.")
-
-# Within-group for ALL groups (only when baseline path used)
-st.subheader("5) Within-group tests (Baseline → each visit, all groups)")
-within_df = compute_within_group_tests(input_echo if input_echo is not None else pd.DataFrame(), observed or VISITS)
+# Within-group across ALL groups
+st.subheader("6) Within-group tests (Baseline → each visit)")
+within_df = compute_within_group_tests(inp, observed or VISITS)
 st.dataframe(within_df)
 
-# Welch t (pairwise on selected pair)
-if len(all_groups) >= 2 and group_a != group_b:
-    st.subheader(f"6) Welch t-tests on change (pairwise: {group_a} vs {group_b})")
-    ttests_df = compute_welch_on_changes(long_change, valid_visits or observed or VISITS, group_a, group_b)
-    st.dataframe(ttests_df)
-else:
-    ttests_df = pd.DataFrame()
+# Welch t on change
+st.subheader(f"7) Welch t-tests on change — {group_a} vs {group_b}")
+ttests_df = compute_welch_on_changes(long_change, valid_visits or observed or VISITS, group_a, group_b)
+st.dataframe(ttests_df)
 
-# Chart for selected pair
-st.subheader("7) Chart (selected pair)")
-if len(all_groups) >= 2 and group_a != group_b and not summary_df.empty and (valid_visits or observed):
+# Chart
+st.subheader("8) Chart (selected pair)")
+if not summary_df.empty and (valid_visits or observed):
     chart_buf = make_chart(summary_df, valid_visits or observed, group_a, group_b)
     if chart_buf is None:
         st.info("Chart skipped: not enough data for selected pair.")
@@ -554,29 +380,17 @@ else:
     st.info("Chart available when two distinct groups and summary stats are present.")
 
 # Build Excel
-st.subheader("8) Download results")
+st.subheader("9) Download results")
 out = io.BytesIO()
 with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-    # Echo raw selections
-    if input_echo is not None and not input_echo.empty:
-        input_echo.to_excel(writer, sheet_name="INPUT_ECHO", index=False)
-    if change_wide is not None and not change_wide.empty:
-        change_wide.to_excel(writer, sheet_name="CHANGE_WIDE", index=False)
-    if not summary_df.empty:
-        summary_df.to_excel(writer, sheet_name="SUMMARY_PAIR", index=False)
-    if 'pv_df' in locals() and not pv_df.empty:
-        pv_df.to_excel(writer, sheet_name="P_VALUES_PAIR", index=False)
-    if not rm_df.empty:
-        rm_df.to_excel(writer, sheet_name="RM_NONPARAM_SUMMARY", index=False)
-    if not within_df.empty:
-        within_df.to_excel(writer, sheet_name="WITHIN_GROUP_TESTS", index=False)
-    if 'ttests_df' in locals() and not ttests_df.empty:
-        ttests_df.to_excel(writer, sheet_name="TTESTS_PAIR", index=False)
-
-    # chart
-    workbook = writer.book
-    ws_chart = workbook.add_worksheet("CHARTS")
-    writer.sheets["CHARTS"] = ws_chart
+    inp.to_excel(writer, sheet_name="INPUT_ECHO", index=False)
+    change_wide.to_excel(writer, sheet_name="CHANGE_WIDE", index=False)
+    if not summary_df.empty: summary_df.to_excel(writer, sheet_name="SUMMARY_PAIR", index=False)
+    if not pv_df.empty: pv_df.to_excel(writer, sheet_name="P_VALUES_PAIR", index=False)
+    if not rm_df.empty: rm_df.to_excel(writer, sheet_name="RM_NONPARAM_SUMMARY", index=False)
+    if not within_df.empty: within_df.to_excel(writer, sheet_name="WITHIN_GROUP_TESTS", index=False)
+    if not ttests_df.empty: ttests_df.to_excel(writer, sheet_name="TTESTS_PAIR", index=False)
+    ws_chart = writer.book.add_worksheet("CHARTS")
     if chart_buf is not None:
         ws_chart.insert_image("B2", "chart.png", {"image_data": chart_buf})
     else:
@@ -585,8 +399,8 @@ with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
 out.seek(0)
 base = uploaded.name.rsplit(".",1)[0]
 st.download_button(
-    "⬇️ Download Excel (includes INPUT/CHANGE/SUMMARY_PAIR/P_VALUES_PAIR/RM/WITHIN/TTESTS/CHARTS as available)",
+    "⬇️ Download Excel",
     data=out,
-    file_name=f"{base}_RESULTS_FLEX.xlsx",
+    file_name=f"{base}_RESULTS_PAIRWISE.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
