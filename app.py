@@ -10,8 +10,8 @@ from statsmodels.stats.anova import anova_lm
 st.set_page_config(page_title="Nonparam P-Values — Pairwise + Repeated Measures", layout="wide")
 st.title("Nonparametric Analysis — Pairwise (USPlus vs Placebo) + Repeated Measures")
 st.caption(
-    "Upload an Excel with raw columns (Baseline & Day 28/56/85). "
-    "Pick the outcome (e.g., Ejaculation/Erection). Map columns if headers differ. "
+    "Upload an Excel with raw columns (Baseline & Day 28/56/85 or Final). "
+    "Pick the outcome (e.g., Ejaculation/Erection). Map columns even if headers differ. "
     "Pairwise is forced to USPlus vs Placebo when both are present."
 )
 
@@ -47,6 +47,7 @@ def compute_rm_all_groups(long_change, visits):
     lc["Change"] = to_num(lc["Change"])
     lc = lc.dropna(subset=["Group","Time","Change"]).copy()
     observed = [v for v in visits if v in lc["Time"].astype(str).unique().tolist()]
+    # Need at least 2 time points to do RM-style effects
     if len(observed) < 2:
         return pd.DataFrame({
             "Effect": ["Group (all groups)", f"Time ({', '.join(observed) if observed else '—'})", "Group × Time"],
@@ -210,7 +211,7 @@ def make_chart(summary_df, visits, group_a, group_b):
 
 # ---------- UI ----------
 st.subheader("1) Upload your Excel (.xlsx)")
-uploaded = st.file_uploader("Workbook with an 'Input-like' sheet (raw BL + Day 28/56/85).", type=["xlsx"])
+uploaded = st.file_uploader("Workbook with an 'Input-like' sheet (raw BL + follow-ups).", type=["xlsx"])
 if not uploaded:
     st.stop()
 
@@ -225,8 +226,7 @@ df = pd.read_excel(uploaded, sheet_name=sheet)
 st.write("Preview:")
 st.dataframe(df.head(8))
 
-# Basic IDs
-# Try to guess subject and group columns
+# Basic IDs (guessers)
 subj_guess = None
 for cand in ["Participant ID","Subject ID","Subject","ID","Participant","Patient ID","Patient"]:
     if cand in df.columns: subj_guess = cand; break
@@ -244,22 +244,19 @@ with st.sidebar:
 # Outcome focus
 with st.sidebar:
     st.header("Outcome")
-    # common quick options + custom
     quick = st.selectbox("Pick outcome keyword", ["Ejaculation", "Erection", "Custom"], index=0)
-    if quick == "Custom":
-        outcome_kw = st.text_input("Enter key word to search in headers (e.g., 'IPSS', 'Frequency', 'QoL')", "Ejaculation")
-    else:
-        outcome_kw = quick
+    outcome_kw = quick if quick != "Custom" else st.text_input("Header keyword (e.g., IPSS, Frequency, QoL)", "Ejaculation")
 
-# Try to guess columns for BL / visits based on the outcome keyword
+# Guess columns (Baseline + Day 28/56/84/85/Final)
 cols = df.columns.tolist()
 bl_guess   = (guess_col(cols, ["bl", norm(outcome_kw)]) or guess_col(cols, ["baseline", norm(outcome_kw)]))
 d28_guess  = guess_col(cols, ["day", "28", norm(outcome_kw)])
 d56_guess  = guess_col(cols, ["day", "56", norm(outcome_kw)])
-d84_guess  = guess_col(cols, ["day", "84", norm(outcome_kw)])  # may be absent
-d85_guess  = guess_col(cols, ["day", "85", norm(outcome_kw)])  # some sheets use Day 85
+d84_guess  = guess_col(cols, ["day", "84", norm(outcome_kw)])
+d85_guess  = guess_col(cols, ["day", "85", norm(outcome_kw)])
+final_guess = (guess_col(cols, ["final", norm(outcome_kw)]) or guess_col(cols, ["end", norm(outcome_kw)]) )
 
-# UI to override mapping
+# UI mapping
 st.subheader("2) Map outcome columns")
 col1, col2 = st.columns(2)
 with col1:
@@ -271,20 +268,26 @@ col3, col4 = st.columns(2)
 with col3:
     d56_col = st.selectbox("Day 56 column", ["<None>"] + cols, index=(cols.index(d56_guess)+1 if d56_guess in cols else 0))
 with col4:
-    # prefer Day 85, otherwise Day 84
     d85_col = st.selectbox("Day 85 (or 84) column", ["<None>"] + cols,
                            index=(cols.index(d85_guess)+1 if d85_guess in cols else (cols.index(d84_guess)+1 if d84_guess in cols else 0)))
 
+# New: Final/Last Visit mapping (for BL+FINAL datasets)
+final_col = st.selectbox("Final / Last Visit column (optional)", ["<None>"] + cols,
+                         index=(cols.index(final_guess)+1 if final_guess in cols else 0))
+
+# Build mapping and visit list (order matters)
 mapped = {
     "Baseline": None if bl_col=="<None>" else bl_col,
     "Day28": None if d28_col=="<None>" else d28_col,
     "Day56": None if d56_col=="<None>" else d56_col,
     "Day85": None if d85_col=="<None>" else d85_col,
+    "Final": None if final_col=="<None>" else final_col,
 }
-VISITS = [v for v in ["Day28","Day56","Day85"] if mapped[v] is not None]
+# Keep order: Day28, Day56, Day85, Final
+VISITS = [v for v in ["Day28","Day56","Day85","Final"] if mapped[v] is not None]
 
 if mapped["Baseline"] is None or len(VISITS)==0:
-    st.error("Please map at least a Baseline and one follow-up (Day 28/56/85).")
+    st.error("Please map at least a Baseline and one follow-up (Day 28/56/85 or Final).")
     st.stop()
 
 # Build INPUT_ECHO and CHANGE_WIDE
@@ -316,7 +319,6 @@ all_groups = sorted(long_change["Group"].dropna().astype(str).str.strip().unique
 if {"USPlus","Placebo"}.issubset(set(all_groups)):
     group_a, group_b = "USPlus", "Placebo"
 else:
-    # fallback to first two
     group_a, group_b = (all_groups + all_groups)[:2]  # safe even if 1 group
 
 with st.sidebar:
@@ -330,7 +332,7 @@ with st.sidebar:
 st.subheader("3) Long-format change (preview)")
 st.dataframe(long_change.head(10))
 
-# RM across ALL groups
+# RM across ALL groups (skips automatically if only 1 visit)
 st.subheader("4) Repeated-measures across ALL groups")
 rm_df, observed = compute_rm_all_groups(long_change, VISITS)
 st.dataframe(rm_df)
@@ -343,7 +345,7 @@ st.dataframe(pv_df)
 with st.expander("Diagnostics (per-visit Ns for selected pair)"):
     st.dataframe(diag_df)
 
-# Add final-visit Mann–Whitney to RM table
+# Add final-visit Mann–Whitney to RM table (works for any single visit incl. Final)
 if len(valid_visits) > 0:
     final_visit = valid_visits[-1]
     a_final = long_change[(long_change["Group"]==group_a) & (long_change["Time"]==final_visit)]["Change"].dropna()
@@ -357,12 +359,12 @@ if len(valid_visits) > 0:
         st.markdown("**RM_NONPARAM_SUMMARY (with final-visit MW)**")
         st.dataframe(rm_df)
 
-# Within-group across ALL groups
+# Within-group tests (Baseline → each visit) — includes Final-only case
 st.subheader("6) Within-group tests (Baseline → each visit)")
 within_df = compute_within_group_tests(inp, observed or VISITS)
 st.dataframe(within_df)
 
-# Welch t on change
+# Welch t on change (between groups)
 st.subheader(f"7) Welch t-tests on change — {group_a} vs {group_b}")
 ttests_df = compute_welch_on_changes(long_change, valid_visits or observed or VISITS, group_a, group_b)
 st.dataframe(ttests_df)
